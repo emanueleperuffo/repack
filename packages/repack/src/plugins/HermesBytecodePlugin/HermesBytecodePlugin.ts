@@ -1,13 +1,8 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import type { Compiler as RspackCompiler } from '@rspack/core';
 import type { Compiler as WebpackCompiler } from 'webpack';
 import type { Rule } from '../../types.js';
-import {
-  composeSourceMaps,
-  getHermesCLIPath,
-  transformBundleToHermesBytecode,
-} from './utils/index.js';
+import { getHermesCLIPath, HermesWorkerPool } from './utils/index.js';
 
 /**
  * {@link HermesBytecodePlugin} configuration options.
@@ -39,6 +34,13 @@ export interface HermesBytecodePluginConfig {
 
   /** Force enable `compareBeforeEmit` webpack output option which this plugin disables by default. */
   compareBeforeEmit?: boolean;
+
+  /**
+   * Maximum number of assets compiled at the same time, each in its own worker process.
+   *
+   * Defaults to the number of available CPUs.
+   */
+  maxWorkers?: number;
 }
 
 /**
@@ -70,7 +72,17 @@ export interface HermesBytecodePluginConfig {
  * @category Webpack Plugin
  */
 export class HermesBytecodePlugin {
-  constructor(private config: HermesBytecodePluginConfig) {}
+  constructor(private config: HermesBytecodePluginConfig) {
+    const { maxWorkers } = config;
+    if (
+      maxWorkers !== undefined &&
+      !(Number.isInteger(maxWorkers) && maxWorkers >= 1)
+    ) {
+      throw new Error(
+        `[RepackHermesBytecodePlugin] maxWorkers must be a positive integer, received ${maxWorkers}`
+      );
+    }
+  }
 
   apply(compiler: RspackCompiler): void;
   apply(compiler: WebpackCompiler): void;
@@ -136,39 +148,35 @@ export class HermesBytecodePlugin {
         const assets = Array.from(emittedAssets);
         emittedAssets.clear();
 
-        await Promise.all(
-          assets.map(async ([file, outputPath]) => {
-            const bundlePath = path.join(outputPath, file);
-            const sourceMapPath = `${bundlePath}.map`;
-            const useSourceMaps = await fs.promises
-              .access(sourceMapPath)
-              .then(() => true)
-              .catch(() => false);
+        const pool = new HermesWorkerPool({
+          maxWorkers: this.config.maxWorkers,
+        });
 
-            logger.debug(
-              `Starting hermes compilation for asset: ${bundlePath}`
-            );
+        try {
+          await Promise.all(
+            assets.map(async ([file, outputPath]) => {
+              const bundlePath = path.join(outputPath, file);
 
-            const { sourceMap: hermesSourceMapPath } =
-              await transformBundleToHermesBytecode({
+              logger.debug(
+                `Starting hermes compilation for asset: ${bundlePath}`
+              );
+
+              const { composedSourceMap } = await pool.run({
                 hermesCLIPath,
-                useSourceMaps,
+                reactNativePath,
                 bundlePath,
               });
 
-            logger.info(`Asset transformed: ${file}`);
+              logger.info(`Asset transformed: ${file}`);
 
-            if (useSourceMaps) {
-              await composeSourceMaps({
-                reactNativePath,
-                packagerMapPath: sourceMapPath,
-                compilerMapPath: hermesSourceMapPath,
-              });
-
-              logger.info(`Asset sourceMap transformed: ${file}.map`);
-            }
-          })
-        );
+              if (composedSourceMap) {
+                logger.info(`Asset sourceMap transformed: ${file}.map`);
+              }
+            })
+          );
+        } finally {
+          pool.close();
+        }
       }
     );
   }

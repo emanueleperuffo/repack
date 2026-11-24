@@ -4,6 +4,7 @@ import path from 'node:path';
 import { type Compiler, ModuleFilenameHelpers } from '@rspack/core';
 import execa from 'execa';
 import { HermesBytecodePlugin } from '../HermesBytecodePlugin/index.js';
+import { composeSourceMaps } from '../HermesBytecodePlugin/utils/composeSourceMaps.js';
 import { getHermesCLIPath } from '../HermesBytecodePlugin/utils/getHermesCLIPath.js';
 
 jest.mock('node:fs', () => ({
@@ -19,6 +20,21 @@ jest.mock('node:fs', () => ({
 }));
 
 jest.mock('execa');
+
+jest.mock('../HermesBytecodePlugin/utils/composeSourceMaps');
+
+// Run jobs in the test process: worker processes are covered by HermesWorkerPool.test.ts.
+jest.mock('../HermesBytecodePlugin/utils/HermesWorkerPool', () => {
+  const { runHermesJob } = jest.requireActual(
+    '../HermesBytecodePlugin/utils/runHermesJob'
+  );
+  return {
+    HermesWorkerPool: class {
+      run = runHermesJob;
+      close() {}
+    },
+  };
+});
 
 function emitAssets(files: string[]) {
   const [, onAssetEmitted] = compilerMock.hooks.assetEmitted.tap.mock.calls[0];
@@ -69,6 +85,20 @@ describe('HermesBytecodePlugin', () => {
     expect(compilerMock.hooks.afterEmit.tapPromise).not.toHaveBeenCalled();
   });
 
+  it.each([0, -1, 1.5, Number.NaN])(
+    'rejects maxWorkers of %p',
+    (maxWorkers) => {
+      expect(
+        () =>
+          new HermesBytecodePlugin({
+            enabled: true,
+            test: /\.bundle$/,
+            maxWorkers,
+          })
+      ).toThrow('maxWorkers must be a positive integer');
+    }
+  );
+
   it('overrides compareBeforeEmit webpack option by default', () => {
     const config = {
       enabled: true,
@@ -106,18 +136,18 @@ describe('HermesBytecodePlugin', () => {
         pluginInstance.apply(compilerMock as unknown as Compiler);
       });
       const execaMock = execa as jest.MockedFunction<typeof execa>;
-      const execaNodeMock = execa.node as jest.MockedFunction<
-        typeof execa.node
-      >;
+      const bundlePath = path.join('output/path/', 'example.bundle');
 
       expect(compilerMock.hooks.afterEmit.tapPromise).toHaveBeenCalledTimes(1);
       expect(execaMock).toHaveBeenCalledTimes(1);
       expect(execaMock.mock.calls[0][0]).toEqual('path/to/hermesc');
 
-      expect(execaNodeMock).toHaveBeenCalledTimes(1);
-      expect(execaNodeMock.mock.calls[0][0]).toEqual(
-        path.normalize('path/to/react-native/scripts/compose-source-maps.js')
-      );
+      expect(composeSourceMaps).toHaveBeenCalledTimes(1);
+      expect(composeSourceMaps).toHaveBeenCalledWith({
+        reactNativePath: 'path/to/react-native',
+        packagerMapPath: `${bundlePath}.map`,
+        compilerMapPath: `${bundlePath}.hbc.map`,
+      });
     });
 
     it('without source-maps if not found', async () => {
@@ -148,6 +178,7 @@ describe('HermesBytecodePlugin', () => {
       expect(compilerMock.hooks.afterEmit.tapPromise).toHaveBeenCalledTimes(1);
       expect(execaMock).toHaveBeenCalledTimes(1);
       expect(execaMock.mock.calls[0][0]).toEqual('path/to/hermesc');
+      expect(composeSourceMaps).not.toHaveBeenCalled();
     });
   });
 
@@ -174,10 +205,9 @@ describe('HermesBytecodePlugin', () => {
     });
 
     const execaMock = execa as jest.MockedFunction<typeof execa>;
-    const execaNodeMock = execa.node as jest.MockedFunction<typeof execa.node>;
 
     expect(execaMock).toHaveBeenCalledTimes(2);
-    expect(execaNodeMock).toHaveBeenCalledTimes(2);
+    expect(composeSourceMaps).toHaveBeenCalledTimes(2);
   });
 
   it('ignores unchanged assets on rebuild', async () => {
